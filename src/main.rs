@@ -821,6 +821,9 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
 }
 
 fn main() -> Result<(), GifError> {
+    // 记录开始时间
+    let start_time = std::time::Instant::now();
+    
     // 解析命令行参数
     let matches = App::new("GIF压缩工具")
         .version("1.0")
@@ -888,6 +891,10 @@ fn main() -> Result<(), GifError> {
     println!("开始压缩 '{}' 到 '{}' (目标: {} KB, 线程数: {})", 
              input, output, target, thread_count);
     optimize_gif(input, output, target, min_frames, thread_count)?;
+    
+    // 计算并输出处理时间
+    let elapsed = start_time.elapsed();
+    println!("处理了 {} 毫秒", elapsed.as_millis());
     
     Ok(())
 }

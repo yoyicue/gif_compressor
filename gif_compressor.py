@@ -6,6 +6,7 @@ from PIL import Image, ImageSequence
 import math
 import shutil
 import multiprocessing
+import time  # 添加时间模块导入
 
 def get_file_size_kb(file_path):
     """获取文件大小（KB）"""
@@ -268,6 +269,9 @@ def optimize_gif(input_path, output_path, target_size_kb, min_frame_percent=10, 
         print("建议尝试允许减少尺寸或颜色数量以达到更小的文件大小。")
 
 def main():
+    # 记录开始时间
+    start_time = time.time()
+    
     parser = argparse.ArgumentParser(description='GIF压缩工具 - 保持颜色和尺寸')
     parser.add_argument('input', help='输入GIF文件路径')
     parser.add_argument('output', help='输出GIF文件路径')
@@ -295,6 +299,10 @@ def main():
     
     final_size = get_file_size_kb(args.output)
     print(f"完成! 最终大小: {final_size:.2f} KB")
+    
+    # 计算并输出处理时间
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    print(f"处理了 {elapsed_ms} 毫秒")
 
 if __name__ == "__main__":
     main()
