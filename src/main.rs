@@ -108,14 +108,14 @@ fn extract_frames<P: AsRef<Path>, Q: AsRef<Path>>(
     }
     
     // 执行gifsicle命令
-    let output = Command::new("gifsicle")
+    let _output = Command::new("gifsicle")
         .args(&gifsicle_args)
         .output()
         .context("执行gifsicle命令失败")?;
     
     // 检查命令是否成功
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !_output.status.success() {
+        let stderr = String::from_utf8_lossy(&_output.stderr);
         return Err(anyhow::anyhow!("gifsicle命令执行失败: {}", stderr));
     }
     
@@ -366,7 +366,7 @@ fn process_strategy(
     
     let args = vec!["-O3", &temp_frames_path, "-o", &temp_frames_opt_path];
     
-    let output = match Command::new("gifsicle")
+    let _output = match Command::new("gifsicle")
         .args(&args)
         .output() {
         Ok(output) => output,
@@ -380,7 +380,7 @@ fn process_strategy(
         }
     };
     
-    if !output.status.success() {
+    if !_output.status.success() {
         log("  帧优化失败");
         return StrategyResult {
             size: f64::MAX,
@@ -479,7 +479,7 @@ fn process_strategy(
                 &temp_path
             ];
             
-            let output = match Command::new("gifsicle")
+            let _output = match Command::new("gifsicle")
                 .args(&args)
                 .output() {
                 Ok(output) if output.status.success() => {
@@ -500,7 +500,7 @@ fn process_strategy(
         }
         
         // 处理这一批次的结果
-        for (result_idx, (level, size)) in results.iter().enumerate() {
+        for (_result_idx, (level, size)) in results.iter().enumerate() {
             if *size <= target_size_kb {
                 log(&format!("  lossy={} 已达到目标大小!", level));
                 
@@ -538,7 +538,7 @@ fn process_strategy(
         }
         
         // 清理这批次中未被选中的临时文件
-        for (level, temp_file) in &temp_files {
+        for (_level, temp_file) in &temp_files {
             if let Some(best) = &best_file {
                 if best.path != temp_file.path {
                     let _ = temp_file.cleanup();
@@ -606,13 +606,13 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
         &temp_file_opt_path               // 输出文件
     ];
     
-    let output = Command::new("gifsicle")
+    let _output = Command::new("gifsicle")
         .args(&args)
         .output()
         .context("执行gifsicle基础优化失败")?;
     
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !_output.status.success() {
+        let stderr = String::from_utf8_lossy(&_output.stderr);
         return Err(anyhow::anyhow!("gifsicle基础优化失败: {}", stderr));
     }
     
