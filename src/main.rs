@@ -87,18 +87,24 @@ fn extract_frames<P: AsRef<Path>, Q: AsRef<Path>>(
         Err(_) => return Err(anyhow::anyhow!("未找到gifsicle命令，请确保已安装"))
     }
     
-    // 构建参数列表，确保所有字符串都已经拥有
-    let mut gifsicle_args = vec![
-        "-o".to_string(), 
-        output_path_str, 
-        "--delay".to_string(), 
-        delay_str, 
-        "--loopcount=forever".to_string()
-    ];
+    // 构建优化的参数列表
+    let mut gifsicle_args = Vec::with_capacity(frame_paths.len() + 8);
+    
+    // 添加优化选项
+    gifsicle_args.push("--no-warnings".to_string());        // 减少不必要的输出
+    gifsicle_args.push("--no-conserve-memory".to_string()); // 使用更多内存提高速度
+    gifsicle_args.push("--no-app-extensions".to_string());  // 移除应用扩展数据
+    gifsicle_args.push("--no-comments".to_string());        // 移除注释
+    gifsicle_args.push("--no-names".to_string());           // 移除名称元数据
+    gifsicle_args.push("-o".to_string());
+    gifsicle_args.push(output_path_str);
+    gifsicle_args.push("--delay".to_string());
+    gifsicle_args.push(delay_str);
+    gifsicle_args.push("--loopcount=forever".to_string());
     
     // 添加所有帧路径 (已经是String类型)
-    for path in frame_paths {
-        gifsicle_args.push(path);
+    for path in &frame_paths {
+        gifsicle_args.push(path.clone());
     }
     
     // 执行gifsicle命令
@@ -148,6 +154,15 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         // 尝试删除文件，但忽略任何错误
         let _ = self.cleanup();
+    }
+}
+
+// Clone实现，允许复制TempFile
+impl Clone for TempFile {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+        }
     }
 }
 
@@ -350,6 +365,7 @@ fn process_strategy(
     let temp_frames_opt_path = temp_frames_opt.path_str();
     
     let args = vec!["-O3", &temp_frames_path, "-o", &temp_frames_opt_path];
+    
     let output = match Command::new("gifsicle")
         .args(&args)
         .output() {
@@ -405,9 +421,15 @@ fn process_strategy(
     let mut best_size = frames_size;
     let mut best_file = Some(temp_frames_opt);
     
-    // 尝试不同的lossy值
-    for lossy_level in [30, 60, 90, 120, 150, 180, 210, 240].iter() {
-        // 检查是否有线程已经找到结果
+    // 批量尝试不同的lossy值
+    // 创建临时文件和对应的lossy级别
+    let lossy_levels = [30, 60, 90, 120, 150, 180, 210, 240];
+    
+    // 每次处理两个lossy级别，平衡进程创建开销和并行效率
+    let chunk_size = 2;
+    
+    for chunk in lossy_levels.chunks(chunk_size) {
+        // 先检查是否有线程已经找到结果
         if shared_state.is_target_found() {
             log("已有其他线程找到满足条件的结果，提前退出");
             return StrategyResult {
@@ -417,77 +439,113 @@ fn process_strategy(
             };
         }
         
-        let temp_final = match NamedTempFile::new() {
-            Ok(file) => TempFile::new(file),
-            Err(_) => {
-                log(&format!("  创建lossy={}临时文件失败", lossy_level));
-                continue;
+        let mut temp_files = Vec::with_capacity(chunk.len());
+        let mut results = Vec::with_capacity(chunk.len());
+        
+        // 创建这一批次的临时文件
+        for &level in chunk {
+            match NamedTempFile::new() {
+                Ok(file) => {
+                    temp_files.push((level, TempFile::new(file)));
+                },
+                Err(_) => {
+                    log(&format!("  创建lossy={}临时文件失败", level));
+                }
             }
-        };
-        
-        let temp_final_path = temp_final.path_str();
-        
-        let lossy_arg = format!("--lossy={}", lossy_level);
-        let current_best_path = match &best_file {
-            Some(file) => file.path_str(),
-            None => continue,
-        };
-        
-        let args = vec!["-O3", &lossy_arg, &current_best_path, "-o", &temp_final_path];
-        
-        let output = match Command::new("gifsicle")
-            .args(&args)
-            .output() {
-            Ok(output) => output,
-            Err(_) => {
-                log(&format!("  执行gifsicle lossy={}压缩失败", lossy_level));
-                continue;
-            }
-        };
-        
-        if !output.status.success() {
-            log(&format!("  lossy={}压缩失败", lossy_level));
-            continue;
         }
         
-        let final_size = match get_file_size_kb(&temp_final_path) {
-            Ok(size) => size,
-            Err(_) => {
-                log(&format!("  无法读取lossy={}压缩后大小", lossy_level));
-                continue;
-            }
+        let current_best_path = match &best_file {
+            Some(file) => file.path_str(),
+            None => break,
         };
         
-        log(&format!("  抽帧 + lossy={} 后大小: {:.2} KB", lossy_level, final_size));
-        
-        if final_size <= target_size_kb {
-            log("  已达到目标大小!");
-            // 如果当前结果比之前的好，替换并清理旧文件
-            if best_size > final_size {
-                if let Some(old_file) = best_file.take() {
-                    let _ = old_file.cleanup(); // 清理旧文件
+        // 处理这一批次的lossy级别
+        for (level, temp_file) in &temp_files {
+            let temp_path = temp_file.path_str();
+            
+            // 创建lossy参数
+            let lossy_arg = format!("--lossy={}", level);
+            
+            // 优化的gifsicle命令参数
+            let args = vec![
+                "-O3", 
+                "--no-warnings",
+                "--no-conserve-memory", 
+                "--no-comments", 
+                "--no-names",
+                &lossy_arg,
+                &current_best_path, 
+                "-o", 
+                &temp_path
+            ];
+            
+            let output = match Command::new("gifsicle")
+                .args(&args)
+                .output() {
+                Ok(output) if output.status.success() => {
+                    match get_file_size_kb(&temp_path) {
+                        Ok(size) => {
+                            log(&format!("  抽帧 + lossy={} 后大小: {:.2} KB", level, size));
+                            results.push((*level, size));
+                        },
+                        Err(_) => {
+                            log(&format!("  无法读取lossy={}压缩后大小", level));
+                        }
+                    }
+                },
+                _ => {
+                    log(&format!("  lossy={}压缩失败", level));
                 }
-                best_size = final_size;
-                best_file = Some(temp_final);
-            } else {
-                // 当前结果不如之前的好，清理
-                let _ = temp_final.cleanup();
+            };
+        }
+        
+        // 处理这一批次的结果
+        for (result_idx, (level, size)) in results.iter().enumerate() {
+            if *size <= target_size_kb {
+                log(&format!("  lossy={} 已达到目标大小!", level));
+                
+                // 找到对应的临时文件
+                if let Some((_, temp_file)) = temp_files.iter().find(|(l, _)| *l == *level) {
+                    // 如果当前结果比之前的好，替换并清理旧文件
+                    if best_size > *size {
+                        if let Some(old_file) = best_file.take() {
+                            let _ = old_file.cleanup(); // 清理旧文件
+                        }
+                        best_size = *size;
+                        best_file = Some(temp_file.clone());
+                    }
+                }
+                
+                // 设置标志通知其他线程已找到满足条件的结果
+                shared_state.set_found_target();
+                break;
+            } else if *size < best_size {
+                // 找到对应的临时文件
+                if let Some((_, temp_file)) = temp_files.iter().find(|(l, _)| *l == *level) {
+                    // 替换旧文件并清理
+                    if let Some(old_file) = best_file.take() {
+                        let _ = old_file.cleanup(); // 清理旧文件
+                    }
+                    best_size = *size;
+                    best_file = Some(temp_file.clone());
+                }
             }
-            // 设置标志通知其他线程已找到满足条件的结果
-            shared_state.set_found_target();
+        }
+        
+        // 如果已找到目标，不再处理更多批次
+        if shared_state.is_target_found() {
             break;
         }
         
-        if final_size < best_size {
-            // 替换旧文件并清理
-            if let Some(old_file) = best_file.take() {
-                let _ = old_file.cleanup(); // 清理旧文件
+        // 清理这批次中未被选中的临时文件
+        for (level, temp_file) in &temp_files {
+            if let Some(best) = &best_file {
+                if best.path != temp_file.path {
+                    let _ = temp_file.cleanup();
+                }
+            } else {
+                let _ = temp_file.cleanup();
             }
-            best_size = final_size;
-            best_file = Some(temp_final);
-        } else {
-            // 当前结果不如之前的好，清理
-            let _ = temp_final.cleanup();
         }
     }
     
@@ -527,14 +585,26 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
         Err(_) => return Err(anyhow::anyhow!("未找到gifsicle命令，请确保已安装"))
     }
     
-    // 基础优化 - 使用gifsicle的最高优化级别
+    // 基础优化 - 使用gifsicle的最高优化级别和更多高级选项
     let temp_file = NamedTempFile::new()?;
     let temp_file_opt = TempFile::new(temp_file);
     let temp_file_opt_path = temp_file_opt.path_str();
     
     // 使用String而不是&str，避免生命周期问题
     let input_path_str = input_path.as_ref().to_string_lossy().to_string();
-    let args = vec!["-O3", &input_path_str, "-o", &temp_file_opt_path];
+    
+    // 构建优化的参数列表
+    let args = vec![
+        "-O3",                            // 最高级别优化
+        "--no-warnings",                  // 不显示警告
+        "--no-conserve-memory",           // 使用更多内存以提高速度
+        "--no-comments",                  // 删除注释以减小文件大小
+        "--no-names",                     // 删除图像和对象名称
+        "--careful",                      // 更慎重的优化，避免损坏文件
+        &input_path_str,                  // 输入文件
+        "-o",                             // 输出选项
+        &temp_file_opt_path               // 输出文件
+    ];
     
     let output = Command::new("gifsicle")
         .args(&args)
