@@ -5,6 +5,9 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::sync::Arc;
+use std::thread;
 use tempfile::{NamedTempFile, TempPath};
 
 /// 获取文件大小（KB）
@@ -130,12 +133,231 @@ impl TempGifFile {
     }
 }
 
-/// 优化GIF到目标大小
+/// 压缩策略结构
+struct Strategy {
+    skip: usize,
+    delay: u16,
+}
+
+/// 策略处理结果
+struct StrategyResult {
+    size: f64,
+    file: Option<TempGifFile>,
+    success: bool,
+}
+
+/// 处理单个策略
+fn process_strategy(
+    input_path: &str,
+    strategy: Strategy,
+    target_size_kb: f64,
+    thread_id: usize,
+) -> StrategyResult {
+    // 创建跟踪输出的记录器
+    let output_prefix = format!("线程 {}: ", thread_id);
+    let log = |msg: &str| {
+        let message = format!("{}{}", output_prefix, msg);
+        // 使用Mutex来确保输出不会被打断
+        println!("{}", message);
+    };
+    
+    let skip = strategy.skip;
+    let delay = strategy.delay;
+    
+    // 预计剩余帧数
+    let expected_frames = match get_frame_count(input_path) {
+        Ok(count) => (count as f64 / skip as f64).ceil() as usize,
+        Err(_) => 0,
+    };
+    
+    log(&format!("策略: 保留约 {} 帧 (每 {} 帧取1帧), 帧延迟: {}ms", 
+                expected_frames, skip, delay));
+    
+    // 使用image库提取帧
+    let temp_frames = match NamedTempFile::new() {
+        Ok(file) => TempGifFile::new(file),
+        Err(_) => {
+            log("  创建临时文件失败");
+            return StrategyResult {
+                size: f64::MAX,
+                file: None,
+                success: false,
+            };
+        }
+    };
+    
+    let temp_frames_path = temp_frames.path_str();
+    
+    if let Err(e) = extract_frames(input_path, &temp_frames_path, skip, delay) {
+        log(&format!("  帧提取失败: {}", e));
+        return StrategyResult {
+            size: f64::MAX,
+            file: None,
+            success: false,
+        };
+    }
+    
+    // 检查提取是否成功
+    match get_file_size_kb(&temp_frames_path) {
+        Ok(size) if size < 1.0 => {
+            log("  帧提取生成的文件过小");
+            return StrategyResult {
+                size: f64::MAX,
+                file: None,
+                success: false,
+            };
+        },
+        Ok(_) => {}, // 文件大小正常，继续处理
+        Err(_) => {
+            log("  无法读取提取的帧大小");
+            return StrategyResult {
+                size: f64::MAX,
+                file: None,
+                success: false,
+            };
+        }
+    };
+    
+    // 优化提取后的帧
+    let temp_frames_opt = match NamedTempFile::new() {
+        Ok(file) => TempGifFile::new(file),
+        Err(_) => {
+            log("  创建优化临时文件失败");
+            return StrategyResult {
+                size: f64::MAX,
+                file: None,
+                success: false,
+            };
+        }
+    };
+    
+    let temp_frames_opt_path = temp_frames_opt.path_str();
+    
+    let args = vec!["-O3", &temp_frames_path, "-o", &temp_frames_opt_path];
+    let output = match Command::new("gifsicle")
+        .args(&args)
+        .output() {
+        Ok(output) => output,
+        Err(_) => {
+            log("  执行gifsicle帧优化失败");
+            return StrategyResult {
+                size: f64::MAX,
+                file: None,
+                success: false,
+            };
+        }
+    };
+    
+    if !output.status.success() {
+        log("  帧优化失败");
+        return StrategyResult {
+            size: f64::MAX,
+            file: None,
+            success: false,
+        };
+    }
+    
+    let frames_size = match get_file_size_kb(&temp_frames_opt_path) {
+        Ok(size) => size,
+        Err(_) => {
+            log("  无法读取优化后帧大小");
+            return StrategyResult {
+                size: f64::MAX,
+                file: None,
+                success: false,
+            };
+        }
+    };
+    
+    log(&format!("  抽帧后大小: {:.2} KB", frames_size));
+    
+    if frames_size <= target_size_kb {
+        log("  已达到目标大小!");
+        return StrategyResult {
+            size: frames_size,
+            file: Some(temp_frames_opt),
+            success: true,
+        };
+    }
+    
+    // 跟踪当前策略下的最佳结果
+    let mut best_size = frames_size;
+    let mut best_file = Some(temp_frames_opt);
+    
+    // 尝试不同的lossy值
+    for lossy_level in [30, 60, 90, 120, 150, 180, 210, 240].iter() {
+        let temp_final = match NamedTempFile::new() {
+            Ok(file) => TempGifFile::new(file),
+            Err(_) => {
+                log(&format!("  创建lossy={}临时文件失败", lossy_level));
+                continue;
+            }
+        };
+        
+        let temp_final_path = temp_final.path_str();
+        
+        let lossy_arg = format!("--lossy={}", lossy_level);
+        let current_best_path = match &best_file {
+            Some(file) => file.path_str(),
+            None => continue,
+        };
+        
+        let args = vec!["-O3", &lossy_arg, &current_best_path, "-o", &temp_final_path];
+        
+        let output = match Command::new("gifsicle")
+            .args(&args)
+            .output() {
+            Ok(output) => output,
+            Err(_) => {
+                log(&format!("  执行gifsicle lossy={}压缩失败", lossy_level));
+                continue;
+            }
+        };
+        
+        if !output.status.success() {
+            log(&format!("  lossy={}压缩失败", lossy_level));
+            continue;
+        }
+        
+        let final_size = match get_file_size_kb(&temp_final_path) {
+            Ok(size) => size,
+            Err(_) => {
+                log(&format!("  无法读取lossy={}压缩后大小", lossy_level));
+                continue;
+            }
+        };
+        
+        log(&format!("  抽帧 + lossy={} 后大小: {:.2} KB", lossy_level, final_size));
+        
+        if final_size <= target_size_kb {
+            log("  已达到目标大小!");
+            if best_size > final_size {
+                best_size = final_size;
+                best_file = Some(temp_final);
+            }
+            break;
+        }
+        
+        if final_size < best_size {
+            best_size = final_size;
+            best_file = Some(temp_final);
+        }
+    }
+    
+    StrategyResult {
+        size: best_size,
+        file: best_file,
+        success: true,
+    }
+}
+
+/// 优化GIF到目标大小 (并行版本)
 fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     input_path: P,
     output_path: Q,
     target_size_kb: f64,
     min_frame_percent: u32,
+    threads: usize,
 ) -> Result<()> {
     // 获取初始文件大小
     let original_size = get_file_size_kb(&input_path)?;
@@ -190,11 +412,6 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     let min_frames = std::cmp::max(3, (original_frame_count as f64 * min_frame_percent as f64 / 100.0) as usize);
     
     // 构建抽帧策略
-    struct Strategy {
-        skip: usize,
-        delay: u16,
-    }
-    
     let mut strategies = Vec::new();
     
     // 从2抽1开始，最多抽到保留最小帧数
@@ -221,111 +438,63 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
         }
     }
     
-    println!("开始尝试不同的抽帧和压缩策略...");
+    // 限制线程数，不超过策略数量
+    let thread_count = std::cmp::min(threads, strategies.len());
+    println!("开始使用 {} 个线程并行处理 {} 个压缩策略...", thread_count, strategies.len());
     
-    // 跟踪最佳结果
+    // 创建通道以接收处理结果
+    let (tx, rx): (Sender<StrategyResult>, Receiver<StrategyResult>) = mpsc::channel();
+    
+    // 创建线程池
+    let input_path_arc = Arc::new(input_path_str);
+    let mut handles = Vec::new();
+    
+    for (i, chunk) in strategies.into_iter().enumerate() {
+        let tx_clone = tx.clone();
+        let input_path_clone = Arc::clone(&input_path_arc);
+        
+        // 创建线程处理这个策略
+        let handle = thread::spawn(move || {
+            let result = process_strategy(
+                &input_path_clone,
+                chunk,
+                target_size_kb,
+                i + 1
+            );
+            // 发送结果到主线程
+            let _ = tx_clone.send(result);
+        });
+        
+        handles.push(handle);
+    }
+    
+    // 丢弃发送者以允许接收者知道何时所有发送者都已完成
+    drop(tx);
+    
+    // 等待并收集所有策略的结果
     let mut best_size = opt_size;
     let mut best_file: Option<TempGifFile> = Some(temp_file_opt);
     
-    // 尝试不同的策略
-    for strategy in strategies {
-        let skip = strategy.skip;
-        let delay = strategy.delay;
-        
-        // 预计剩余帧数
-        let expected_frames = (original_frame_count as f64 / skip as f64).ceil() as usize;
-        println!("\n策略: 保留约 {} 帧 (每 {} 帧取1帧), 帧延迟: {}ms", expected_frames, skip, delay);
-        
-        // 使用image库提取帧
-        let temp_file = NamedTempFile::new()?;
-        let temp_frames = TempGifFile::new(temp_file);
-        let temp_frames_path = temp_frames.path_str();
-        
-        if let Err(e) = extract_frames(&input_path, &temp_frames_path, skip, delay) {
-            println!("  帧提取失败: {}, 跳过此策略", e);
+    // 从通道接收结果
+    for result in rx.iter() {
+        if !result.success {
             continue;
         }
         
-        // 检查提取是否成功
-        if let Ok(frames_size) = get_file_size_kb(&temp_frames_path) {
-            if frames_size < 1.0 {
-                println!("  帧提取生成的文件过小，跳过此策略");
-                continue;
-            }
-        } else {
-            println!("  无法读取提取的帧大小，跳过此策略");
-            continue;
+        if result.size <= target_size_kb {
+            best_size = result.size;
+            best_file = result.file;
+            println!("找到达到目标大小的策略! 大小: {:.2} KB", best_size);
+            break; // 已经找到满足条件的结果，可以提前结束
+        } else if result.size < best_size {
+            best_size = result.size;
+            best_file = result.file;
         }
-        
-        // 优化提取后的帧
-        let temp_file = NamedTempFile::new()?;
-        let temp_frames_opt = TempGifFile::new(temp_file);
-        let temp_frames_opt_path = temp_frames_opt.path_str();
-        
-        let args = vec!["-O3", &temp_frames_path, "-o", &temp_frames_opt_path];
-        let output = Command::new("gifsicle")
-            .args(&args)
-            .output()
-            .context("执行gifsicle帧优化失败")?;
-        
-        if !output.status.success() {
-            println!("  帧优化失败，跳过此策略");
-            continue;
-        }
-        
-        let frames_size = get_file_size_kb(&temp_frames_opt_path)?;
-        println!("  抽帧后大小: {:.2} KB", frames_size);
-        
-        if frames_size <= target_size_kb {
-            println!("  已达到目标大小!");
-            if best_size > frames_size || best_size > target_size_kb {
-                best_size = frames_size;
-                best_file = Some(temp_frames_opt);
-            }
-            continue;
-        }
-        
-        // 尝试不同的lossy值
-        for lossy_level in [30, 60, 90, 120, 150, 180, 210, 240].iter() {
-            let temp_file = NamedTempFile::new()?;
-            let temp_final = TempGifFile::new(temp_file);
-            let temp_final_path = temp_final.path_str();
-            
-            let lossy_arg = format!("--lossy={}", lossy_level);
-            let args = vec!["-O3", &lossy_arg, &temp_frames_opt_path, "-o", &temp_final_path];
-            
-            let output = Command::new("gifsicle")
-                .args(&args)
-                .output()
-                .context("执行gifsicle lossy压缩失败")?;
-            
-            if !output.status.success() {
-                println!("  lossy压缩失败，跳过此lossy级别");
-                continue;
-            }
-            
-            let final_size = get_file_size_kb(&temp_final_path)?;
-            println!("  抽帧 + lossy={} 后大小: {:.2} KB", lossy_level, final_size);
-            
-            if final_size <= target_size_kb {
-                println!("  已达到目标大小!");
-                if best_size > final_size {
-                    best_size = final_size;
-                    best_file = Some(temp_final);
-                }
-                break;
-            }
-            
-            if final_size < best_size {
-                best_size = final_size;
-                best_file = Some(temp_final);
-            }
-        }
-        
-        // 如果这个策略下的最佳大小已经达到目标，就不再尝试其他策略
-        if best_size <= target_size_kb {
-            break;
-        }
+    }
+    
+    // 等待所有线程完成
+    for handle in handles {
+        let _ = handle.join();
     }
     
     // 使用找到的最佳文件
@@ -374,6 +543,11 @@ fn main() -> Result<()> {
             .help("保留的最小帧数百分比，默认为原始帧数的10%")
             .takes_value(true)
             .default_value("10"))
+        .arg(Arg::with_name("threads")
+            .long("threads")
+            .help("并行处理线程数，默认为系统CPU核心数")
+            .takes_value(true)
+            .default_value("0"))
         .get_matches();
     
     let input = matches.value_of("input").unwrap();
@@ -386,6 +560,17 @@ fn main() -> Result<()> {
         .unwrap()
         .parse::<u32>()
         .unwrap_or(10);
+    let threads = matches.value_of("threads")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap_or(0);
+    
+    // 如果线程数为0，使用系统CPU核心数
+    let thread_count = if threads == 0 {
+        num_cpus::get()
+    } else {
+        threads
+    };
     
     // 检查输入文件是否存在
     if !Path::new(input).exists() {
@@ -399,8 +584,9 @@ fn main() -> Result<()> {
         }
     }
     
-    println!("开始压缩 '{}' 到 '{}' (目标: {} KB)", input, output, target);
-    optimize_gif(input, output, target, min_frames)?;
+    println!("开始压缩 '{}' 到 '{}' (目标: {} KB, 线程数: {})", 
+             input, output, target, thread_count);
+    optimize_gif(input, output, target, min_frames, thread_count)?;
     
     Ok(())
 }
