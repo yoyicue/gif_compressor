@@ -164,13 +164,70 @@ struct StrategyResult {
     success: bool,
 }
 
+/// 共享状态结构体，用于线程间通信
+struct SharedState {
+    // 是否找到满足目标大小的结果
+    found_target: AtomicBool,
+    // 当前已找到的最佳大小，初始值设为最大值
+    best_size: std::sync::atomic::AtomicU64,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        Self {
+            found_target: AtomicBool::new(false),
+            best_size: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+    
+    // 更新最佳大小（如果提供的大小更小）
+    fn update_best_size(&self, size: f64) -> bool {
+        let size_bits = size.to_bits();
+        let mut current = self.best_size.load(Ordering::Relaxed);
+        
+        loop {
+            // 如果新大小不比当前更好，不更新
+            if size_bits >= current {
+                return false;
+            }
+            
+            // 尝试原子更新，成功则返回true
+            match self.best_size.compare_exchange(
+                current,
+                size_bits,
+                Ordering::SeqCst,
+                Ordering::Relaxed
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+    
+    // 获取当前最佳大小
+    fn get_best_size(&self) -> f64 {
+        let bits = self.best_size.load(Ordering::Relaxed);
+        f64::from_bits(bits)
+    }
+    
+    // 设置已找到目标
+    fn set_found_target(&self) {
+        self.found_target.store(true, Ordering::Relaxed);
+    }
+    
+    // 检查是否已找到目标
+    fn is_target_found(&self) -> bool {
+        self.found_target.load(Ordering::Relaxed)
+    }
+}
+
 /// 处理单个策略
 fn process_strategy(
     input_path: &str,
     strategy: Strategy,
     target_size_kb: f64,
     thread_id: usize,
-    found_target: &AtomicBool,
+    shared_state: &SharedState,
 ) -> StrategyResult {
     // 创建跟踪输出的记录器
     let output_prefix = format!("线程 {}: ", thread_id);
@@ -181,7 +238,7 @@ fn process_strategy(
     };
     
     // 如果已经找到目标，立即返回
-    if found_target.load(Ordering::Relaxed) {
+    if shared_state.is_target_found() {
         log("已有其他线程找到满足条件的结果，提前退出");
         return StrategyResult {
             size: f64::MAX,
@@ -216,7 +273,7 @@ fn process_strategy(
     };
     
     // 检查是否有线程已经找到结果
-    if found_target.load(Ordering::Relaxed) {
+    if shared_state.is_target_found() {
         log("已有其他线程找到满足条件的结果，提前退出");
         return StrategyResult {
             size: f64::MAX,
@@ -237,7 +294,7 @@ fn process_strategy(
     }
     
     // 检查是否有线程已经找到结果
-    if found_target.load(Ordering::Relaxed) {
+    if shared_state.is_target_found() {
         log("已有其他线程找到满足条件的结果，提前退出");
         return StrategyResult {
             size: f64::MAX,
@@ -281,7 +338,7 @@ fn process_strategy(
     };
     
     // 检查是否有线程已经找到结果
-    if found_target.load(Ordering::Relaxed) {
+    if shared_state.is_target_found() {
         log("已有其他线程找到满足条件的结果，提前退出");
         return StrategyResult {
             size: f64::MAX,
@@ -336,7 +393,7 @@ fn process_strategy(
     if frames_size <= target_size_kb {
         log("  已达到目标大小!");
         // 设置标志通知其他线程已找到满足条件的结果
-        found_target.store(true, Ordering::Relaxed);
+        shared_state.set_found_target();
         return StrategyResult {
             size: frames_size,
             file: Some(temp_frames_opt),
@@ -351,7 +408,7 @@ fn process_strategy(
     // 尝试不同的lossy值
     for lossy_level in [30, 60, 90, 120, 150, 180, 210, 240].iter() {
         // 检查是否有线程已经找到结果
-        if found_target.load(Ordering::Relaxed) {
+        if shared_state.is_target_found() {
             log("已有其他线程找到满足条件的结果，提前退出");
             return StrategyResult {
                 size: best_size,
@@ -417,7 +474,7 @@ fn process_strategy(
                 let _ = temp_final.cleanup();
             }
             // 设置标志通知其他线程已找到满足条件的结果
-            found_target.store(true, Ordering::Relaxed);
+            shared_state.set_found_target();
             break;
         }
         
@@ -539,13 +596,16 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     let input_path_arc = Arc::new(input_path_str);
     let mut handles = Vec::new();
     
-    // 创建一个原子布尔值来标记是否找到满足条件的结果
-    let found_target = Arc::new(AtomicBool::new(false));
+    // 创建共享状态
+    let shared_state = Arc::new(SharedState::new());
+    
+    // 设置初始最佳大小为基础优化后的大小
+    shared_state.update_best_size(opt_size);
     
     for (i, chunk) in strategies.into_iter().enumerate() {
         let tx_clone = tx.clone();
         let input_path_clone = Arc::clone(&input_path_arc);
-        let found_target_clone = Arc::clone(&found_target);
+        let shared_state_clone = Arc::clone(&shared_state);
         
         // 创建线程处理这个策略
         let handle = thread::spawn(move || {
@@ -554,8 +614,19 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
                 chunk,
                 target_size_kb,
                 i + 1,
-                &found_target_clone
+                &shared_state_clone
             );
+            
+            // 如果这是一个好的结果，更新共享状态中的最佳大小
+            if result.success && result.size < shared_state_clone.get_best_size() {
+                let is_better = shared_state_clone.update_best_size(result.size);
+                
+                // 如果我们的结果被接受为更好的结果，并且达到了目标大小，设置found_target标志
+                if is_better && result.size <= target_size_kb {
+                    shared_state_clone.set_found_target();
+                }
+            }
+            
             // 发送结果到主线程
             let _ = tx_clone.send(result);
         });
@@ -588,7 +659,7 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
             found_solution = true;
             println!("找到达到目标大小的策略! 大小: {:.2} KB", best_size);
             // 设置标志，以便其他线程可以提前退出
-            found_target.store(true, Ordering::Relaxed);
+            shared_state.set_found_target();
             break; // 提前退出循环，不再处理其他结果
         } else if result.size < best_size {
             // 清理之前的最佳文件（如果有的话）
