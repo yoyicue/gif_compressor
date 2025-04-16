@@ -153,10 +153,10 @@ Rust实现版本还包含一些额外的优化：
 python gif_compressor.py input.gif output.gif
 ```
 
-#### 将GIF压缩到300KB以下，保留至少20%的帧:
+#### 将GIF压缩到500KB以下，保留至少20%的帧:
 
 ```bash
-python gif_compressor.py input.gif output.gif --target 300 --min-frames 20
+python gif_compressor.py input.gif output.gif --target 500 --min-frames 20
 ```
 
 ### Rust版本
@@ -169,10 +169,10 @@ python gif_compressor.py input.gif output.gif --target 300 --min-frames 20
 cargo run --release -- input.gif output.gif
 ```
 
-##### 将GIF压缩到300KB以下，保留至少20%的帧:
+##### 将GIF压缩到500KB以下，保留至少20%的帧:
 
 ```bash
-cargo run --release -- input.gif output.gif --target 300 --min-frames 20
+cargo run --release -- input.gif output.gif --target 500 --min-frames 20
 ```
 
 ##### 使用8个线程进行并行处理:
@@ -189,10 +189,10 @@ cargo run --release -- input.gif output.gif --threads 8
 ./target/release/gif_compressor input.gif output.gif
 ```
 
-##### 将GIF压缩到300KB以下，保留至少20%的帧:
+##### 将GIF压缩到500KB以下，保留至少20%的帧:
 
 ```bash
-./target/release/gif_compressor input.gif output.gif --target 300 --min-frames 20
+./target/release/gif_compressor input.gif output.gif --target 500 --min-frames 20
 ```
 
 ##### 使用8个线程进行并行处理:
