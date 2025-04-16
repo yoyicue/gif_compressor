@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{App, Arg};
 use image::{codecs::gif::GifDecoder, AnimationDecoder};
 use std::fs::{self, File};
@@ -10,17 +10,56 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tempfile::NamedTempFile;
+use thiserror::Error;
+
+/// 自定义错误类型
+#[derive(Error, Debug)]
+pub enum GifError {
+    #[error("IO错误: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("图像处理错误: {0}")]
+    Image(#[from] image::error::ImageError),
+    
+    #[error("GIF没有帧")]
+    NoFrames,
+    
+    #[error("未找到gifsicle命令，请确保已安装")]
+    GifsicleNotFound,
+    
+    #[error("gifsicle命令执行失败: {0}")]
+    GifsicleExecFailed(String),
+    
+    #[error("输入文件不存在: {0}")]
+    InputFileNotFound(String),
+    
+    #[error("没有找到有效的优化结果")]
+    NoValidResults,
+    
+    #[error("临时目录创建失败: {0}")]
+    TempDirFailed(String),
+    
+    #[error("{0}")]
+    Other(String),
+}
+
+// 添加从anyhow::Error到GifError的实现
+impl From<anyhow::Error> for GifError {
+    fn from(err: anyhow::Error) -> Self {
+        GifError::Other(err.to_string())
+    }
+}
 
 /// 获取文件大小（KB）
-fn get_file_size_kb<P: AsRef<Path>>(path: P) -> Result<f64> {
-    let metadata = fs::metadata(path).context("获取文件元数据失败")?;
+fn get_file_size_kb<P: AsRef<Path>>(path: P) -> Result<f64, GifError> {
+    let metadata = fs::metadata(path)?;
     Ok(metadata.len() as f64 / 1024.0)
 }
 
 /// 获取GIF的帧数
-fn get_frame_count<P: AsRef<Path>>(path: P) -> Result<usize> {
-    let file = File::open(path).context("打开文件失败")?;
-    let decoder = GifDecoder::new(BufReader::new(file)).context("创建GIF解码器失败")?;
+fn get_frame_count<P: AsRef<Path>>(path: P) -> Result<usize, GifError> {
+    let file = File::open(path)?;
+    let decoder = GifDecoder::new(BufReader::new(file))?;
     let frames = decoder.into_frames();
     let count = frames.count();
     Ok(count)
@@ -32,13 +71,13 @@ fn extract_frames<P: AsRef<Path>, Q: AsRef<Path>>(
     output_path: Q,
     skip: usize,
     delay: u16,
-) -> Result<()> {
+) -> Result<(), GifError> {
     // 打开输入文件
-    let file = File::open(&input_path).context("打开输入文件失败")?;
-    let decoder = GifDecoder::new(BufReader::new(file)).context("创建GIF解码器失败")?;
+    let file = File::open(&input_path)?;
+    let decoder = GifDecoder::new(BufReader::new(file))?;
     
     // 提取所有帧
-    let frames = decoder.into_frames().collect_frames().context("收集GIF帧失败")?;
+    let frames = decoder.into_frames().collect_frames()?;
     let total_frames = frames.len();
     
     // 根据skip参数选择帧
@@ -52,7 +91,7 @@ fn extract_frames<P: AsRef<Path>, Q: AsRef<Path>>(
         if !frames.is_empty() {
             selected_frames.push(frames[0].clone());
         } else {
-            return Err(anyhow::anyhow!("输入GIF没有帧"));
+            return Err(GifError::NoFrames);
         }
     }
     
@@ -60,18 +99,17 @@ fn extract_frames<P: AsRef<Path>, Q: AsRef<Path>>(
     let temp_dir = tempfile::Builder::new()
         .prefix("gif_frames_")
         .tempdir()
-        .context("创建临时目录失败")?;
+        .map_err(|e| GifError::TempDirFailed(e.to_string()))?;
     
     // 保存所有选择的帧到临时目录，并收集路径字符串
     let mut frame_paths = Vec::new();
     for (i, frame) in selected_frames.iter().enumerate() {
         let frame_path = temp_dir.path().join(format!("frame_{}.gif", i));
-        let frame_file = File::create(&frame_path).context("创建临时帧文件失败")?;
+        let frame_file = File::create(&frame_path)?;
         let mut frame_writer = BufWriter::new(frame_file);
         
         // 使用image库保存单帧GIF
-        frame.buffer().write_to(&mut frame_writer, image::ImageOutputFormat::Gif)
-            .context("写入帧数据失败")?;
+        frame.buffer().write_to(&mut frame_writer, image::ImageOutputFormat::Gif)?;
         
         // 保存路径字符串
         frame_paths.push(frame_path.to_string_lossy().to_string());
@@ -84,7 +122,7 @@ fn extract_frames<P: AsRef<Path>, Q: AsRef<Path>>(
     // 检查gifsicle是否存在
     match Command::new("gifsicle").arg("--version").output() {
         Ok(_) => {}, // 命令存在，继续执行
-        Err(_) => return Err(anyhow::anyhow!("未找到gifsicle命令，请确保已安装"))
+        Err(_) => return Err(GifError::GifsicleNotFound),
     }
     
     // 构建优化的参数列表
@@ -110,13 +148,12 @@ fn extract_frames<P: AsRef<Path>, Q: AsRef<Path>>(
     // 执行gifsicle命令
     let _output = Command::new("gifsicle")
         .args(&gifsicle_args)
-        .output()
-        .context("执行gifsicle命令失败")?;
+        .output()?;
     
     // 检查命令是否成功
     if !_output.status.success() {
-        let stderr = String::from_utf8_lossy(&_output.stderr);
-        return Err(anyhow::anyhow!("gifsicle命令执行失败: {}", stderr));
+        let stderr = String::from_utf8_lossy(&_output.stderr).to_string();
+        return Err(GifError::GifsicleExecFailed(stderr));
     }
     
     Ok(())
@@ -563,7 +600,7 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     target_size_kb: f64,
     min_frame_percent: u32,
     threads: usize,
-) -> Result<()> {
+) -> Result<(), GifError> {
     // 获取初始文件大小
     let original_size = get_file_size_kb(&input_path)?;
     println!("原始大小: {:.2} KB", original_size);
@@ -582,7 +619,7 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     // 检查gifsicle是否存在
     match Command::new("gifsicle").arg("--version").output() {
         Ok(_) => {}, // 命令存在，继续执行
-        Err(_) => return Err(anyhow::anyhow!("未找到gifsicle命令，请确保已安装"))
+        Err(_) => return Err(GifError::GifsicleNotFound),
     }
     
     // 基础优化 - 使用gifsicle的最高优化级别和更多高级选项
@@ -608,12 +645,11 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     
     let _output = Command::new("gifsicle")
         .args(&args)
-        .output()
-        .context("执行gifsicle基础优化失败")?;
+        .output()?;
     
     if !_output.status.success() {
-        let stderr = String::from_utf8_lossy(&_output.stderr);
-        return Err(anyhow::anyhow!("gifsicle基础优化失败: {}", stderr));
+        let stderr = String::from_utf8_lossy(&_output.stderr).to_string();
+        return Err(GifError::GifsicleExecFailed(stderr));
     }
     
     let opt_size = get_file_size_kb(&temp_file_opt_path)?;
@@ -763,8 +799,7 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     // 使用找到的最佳文件
     if let Some(best) = best_file {
         println!("\n复制最佳结果到输出文件...");
-        fs::copy(&best.path, &output_path)
-            .context("复制最佳结果到输出文件失败")?;
+        fs::copy(&best.path, &output_path)?;
         
         // 复制完成后清理临时文件
         let _ = best.cleanup();
@@ -772,7 +807,7 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
         let final_size = get_file_size_kb(&output_path)?;
         println!("完成! 最终大小: {:.2} KB", final_size);
     } else {
-        return Err(anyhow::anyhow!("没有找到有效的优化结果"));
+        return Err(GifError::NoValidResults);
     }
     
     // 如果还是没达到目标大小，给出提示
@@ -785,7 +820,7 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<(), GifError> {
     // 解析命令行参数
     let matches = App::new("GIF压缩工具")
         .version("1.0")
@@ -840,7 +875,7 @@ fn main() -> Result<()> {
     
     // 检查输入文件是否存在
     if !Path::new(input).exists() {
-        return Err(anyhow::anyhow!("错误: 输入文件 '{}' 不存在", input));
+        return Err(GifError::InputFileNotFound(input.to_string()));
     }
     
     // 确保目标路径的目录存在
