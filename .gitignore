@@ -1,0 +1,54 @@
+# Rust忽略项
+/target/
+**/*.rs.bk
+*.pdb
+
+# Python忽略项
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+pytest.ini
+.coverage
+htmlcov/
+
+# 编辑器和IDE文件
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# 临时文件
+*.log
+*.tmp
+tmp/
+temp/
+
+# 项目特定文件
+*.gif
+
+# 其他
+.env
+.env.*
+!.env.example
