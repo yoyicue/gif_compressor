@@ -20,6 +20,9 @@
 
 - Python 3.6+
 - PIL/Pillow - Python图像处理库
+- Pillow>=9.0.0 - 图像处理库，用于GIF处理
+- python-magic>=0.4.24 - 用于文件类型检测
+- tqdm>=4.62.0 - 用于显示进度条，提供更好的用户体验
 
 ### Rust版本依赖
 
@@ -59,6 +62,7 @@ source .venv/bin/activate  # Linux/macOS
 2. 安装依赖:
 ```bash
 pip install Pillow
+pip install -r requirements.txt
 ```
 
 ### Rust版本
