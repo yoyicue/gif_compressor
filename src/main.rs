@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tempfile::{NamedTempFile, TempPath};
 
@@ -152,6 +153,7 @@ fn process_strategy(
     strategy: Strategy,
     target_size_kb: f64,
     thread_id: usize,
+    found_target: &AtomicBool,
 ) -> StrategyResult {
     // 创建跟踪输出的记录器
     let output_prefix = format!("线程 {}: ", thread_id);
@@ -160,6 +162,16 @@ fn process_strategy(
         // 使用Mutex来确保输出不会被打断
         println!("{}", message);
     };
+    
+    // 如果已经找到目标，立即返回
+    if found_target.load(Ordering::Relaxed) {
+        log("已有其他线程找到满足条件的结果，提前退出");
+        return StrategyResult {
+            size: f64::MAX,
+            file: None,
+            success: false,
+        };
+    }
     
     let skip = strategy.skip;
     let delay = strategy.delay;
@@ -186,10 +198,30 @@ fn process_strategy(
         }
     };
     
+    // 检查是否有线程已经找到结果
+    if found_target.load(Ordering::Relaxed) {
+        log("已有其他线程找到满足条件的结果，提前退出");
+        return StrategyResult {
+            size: f64::MAX,
+            file: None,
+            success: false,
+        };
+    }
+    
     let temp_frames_path = temp_frames.path_str();
     
     if let Err(e) = extract_frames(input_path, &temp_frames_path, skip, delay) {
         log(&format!("  帧提取失败: {}", e));
+        return StrategyResult {
+            size: f64::MAX,
+            file: None,
+            success: false,
+        };
+    }
+    
+    // 检查是否有线程已经找到结果
+    if found_target.load(Ordering::Relaxed) {
+        log("已有其他线程找到满足条件的结果，提前退出");
         return StrategyResult {
             size: f64::MAX,
             file: None,
@@ -230,6 +262,16 @@ fn process_strategy(
             };
         }
     };
+    
+    // 检查是否有线程已经找到结果
+    if found_target.load(Ordering::Relaxed) {
+        log("已有其他线程找到满足条件的结果，提前退出");
+        return StrategyResult {
+            size: f64::MAX,
+            file: None,
+            success: false,
+        };
+    }
     
     let temp_frames_opt_path = temp_frames_opt.path_str();
     
@@ -273,6 +315,8 @@ fn process_strategy(
     
     if frames_size <= target_size_kb {
         log("  已达到目标大小!");
+        // 设置标志通知其他线程已找到满足条件的结果
+        found_target.store(true, Ordering::Relaxed);
         return StrategyResult {
             size: frames_size,
             file: Some(temp_frames_opt),
@@ -286,6 +330,16 @@ fn process_strategy(
     
     // 尝试不同的lossy值
     for lossy_level in [30, 60, 90, 120, 150, 180, 210, 240].iter() {
+        // 检查是否有线程已经找到结果
+        if found_target.load(Ordering::Relaxed) {
+            log("已有其他线程找到满足条件的结果，提前退出");
+            return StrategyResult {
+                size: best_size,
+                file: best_file,
+                success: true,
+            };
+        }
+        
         let temp_final = match NamedTempFile::new() {
             Ok(file) => TempGifFile::new(file),
             Err(_) => {
@@ -335,6 +389,8 @@ fn process_strategy(
                 best_size = final_size;
                 best_file = Some(temp_final);
             }
+            // 设置标志通知其他线程已找到满足条件的结果
+            found_target.store(true, Ordering::Relaxed);
             break;
         }
         
@@ -449,9 +505,13 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     let input_path_arc = Arc::new(input_path_str);
     let mut handles = Vec::new();
     
+    // 创建一个原子布尔值来标记是否找到满足条件的结果
+    let found_target = Arc::new(AtomicBool::new(false));
+    
     for (i, chunk) in strategies.into_iter().enumerate() {
         let tx_clone = tx.clone();
         let input_path_clone = Arc::clone(&input_path_arc);
+        let found_target_clone = Arc::clone(&found_target);
         
         // 创建线程处理这个策略
         let handle = thread::spawn(move || {
@@ -459,7 +519,8 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
                 &input_path_clone,
                 chunk,
                 target_size_kb,
-                i + 1
+                i + 1,
+                &found_target_clone
             );
             // 发送结果到主线程
             let _ = tx_clone.send(result);
@@ -474,6 +535,7 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     // 等待并收集所有策略的结果
     let mut best_size = opt_size;
     let mut best_file: Option<TempGifFile> = Some(temp_file_opt);
+    let mut found_solution = false;
     
     // 从通道接收结果
     for result in rx.iter() {
@@ -484,17 +546,28 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
         if result.size <= target_size_kb {
             best_size = result.size;
             best_file = result.file;
+            found_solution = true;
             println!("找到达到目标大小的策略! 大小: {:.2} KB", best_size);
-            break; // 已经找到满足条件的结果，可以提前结束
+            // 设置标志，以便其他线程可以提前退出
+            found_target.store(true, Ordering::Relaxed);
+            break; // 提前退出循环，不再处理其他结果
         } else if result.size < best_size {
             best_size = result.size;
             best_file = result.file;
         }
     }
     
-    // 等待所有线程完成
-    for handle in handles {
-        let _ = handle.join();
+    // 我们不再等待所有线程完成
+    // 如果已经找到满足条件的结果，其他线程会自动退出
+    // 如果我们想要优雅地等待，可以设置一个超时
+    if found_solution {
+        println!("已找到满足条件的结果，不再等待其他线程");
+    } else {
+        println!("尚未找到满足目标大小的结果，等待所有线程完成...");
+        // 等待所有线程完成
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
     
     // 使用找到的最佳文件
