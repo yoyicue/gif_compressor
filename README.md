@@ -8,6 +8,7 @@
 - 保持图像的颜色数量和尺寸
 - 自动优化帧数和帧延迟
 - 使用多种压缩策略寻找最佳压缩效果
+- 支持多线程并行处理，提高压缩速度
 - 提供详细的压缩过程日志
 
 ## 依赖
@@ -31,6 +32,7 @@
 - image - Rust图像处理库
 - tempfile - 临时文件处理库
 - anyhow - 错误处理库
+- num_cpus - 获取系统CPU核心数量的库
 
 ## 安装
 
@@ -98,6 +100,7 @@ cargo run --release -- 输入.gif 输出.gif [--target 目标大小KB] [--min-fr
 - `输出.gif`: 压缩后的GIF文件保存路径
 - `--target`: 目标文件大小（KB），默认为500KB
 - `--min-frames`: 保留的最小帧数百分比，默认为原始帧数的10%
+- `--threads`: 并行处理线程数，默认为系统CPU核心数量（0表示自动检测）
 
 ## 压缩策略
 
@@ -107,6 +110,7 @@ cargo run --release -- 输入.gif 输出.gif [--target 目标大小KB] [--min-fr
 2. 帧抽取 - 通过跳过一定数量的帧来减小文件大小
 3. Lossy压缩 - 使用gifsicle的lossy参数进行有损压缩
 4. 帧延迟调整 - 根据抽帧比例自动调整帧延迟时间
+5. 多线程并行处理 - 同时尝试多种压缩策略，加快处理速度并找到最优解
 
 工具会自动尝试多种组合策略，并选择最佳压缩效果。
 
@@ -142,6 +146,12 @@ cargo run --release -- input.gif output.gif
 cargo run --release -- input.gif output.gif --target 300 --min-frames 20
 ```
 
+##### 使用8个线程进行并行处理:
+
+```bash
+cargo run --release -- input.gif output.gif --threads 8
+```
+
 #### 使用编译后的二进制文件:
 
 ##### 将GIF压缩到500KB以下:
@@ -154,6 +164,12 @@ cargo run --release -- input.gif output.gif --target 300 --min-frames 20
 
 ```bash
 ./target/release/gif_compressor input.gif output.gif --target 300 --min-frames 20
+```
+
+##### 使用8个线程进行并行处理:
+
+```bash
+./target/release/gif_compressor input.gif output.gif --threads 8
 ```
 
 ## 注意事项
