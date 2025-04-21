@@ -201,6 +201,32 @@ cargo run --release -- input.gif output.gif --threads 8
 ./target/release/gif_compressor input.gif output.gif --threads 8
 ```
 
+## 批量处理脚本
+
+提供了 `compress_gifs.sh` 脚本，可自动寻找最优参数并批量处理 GIF 文件：
+
+```bash
+# 编译工具
+cargo build
+
+# 运行脚本
+./compress_gifs.sh
+```
+
+脚本会自动测试从 95 到 10 的不同 min-frames 参数，为每个 GIF 文件找到最佳压缩设置。
+
+### 可配置参数
+
+```bash
+# 脚本顶部可修改的配置
+INPUT_DIR="input"        # 输入目录
+OUTPUT_DIR="output"      # 输出目录
+TARGET_SIZE=500          # 目标大小(KB)
+MAX_MIN_FRAMES=95        # 最大测试值
+MIN_MIN_FRAMES=10        # 最小测试值
+STEP_SIZE=5              # 测试步长
+```
+
 ## 注意事项
 
 - 如果无法达到目标大小，工具会输出最接近目标大小的结果
