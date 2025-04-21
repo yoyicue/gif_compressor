@@ -165,12 +165,12 @@ struct TempFile {
 }
 
 impl TempFile {
-    fn new(temp_file: NamedTempFile) -> Self {
-        // 将临时文件转换为保留路径但取消自动删除的版本
-        let path = temp_file.path().to_path_buf();
-        let _temp_path = temp_file.into_temp_path();
-        // 这里_temp_path会被丢弃，但文件不会被删除
-        Self { path }
+    fn new(temp_file: NamedTempFile) -> Result<Self, std::io::Error> {
+        // 使用 keep() 来获取路径并取消自动删除
+        match temp_file.keep() {
+            Ok((_file, path)) => Ok(Self { path }), // keep 成功，返回 Self
+            Err(persist_error) => Err(persist_error.error), // keep 失败，返回 IO 错误
+        }
     }
     
     fn path_str(&self) -> String {
@@ -183,14 +183,6 @@ impl TempFile {
             std::fs::remove_file(&self.path)?;
         }
         Ok(())
-    }
-}
-
-// Drop实现会在TempFile被丢弃时尝试删除文件
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        // 尝试删除文件，但忽略任何错误
-        let _ = self.cleanup();
     }
 }
 
@@ -313,9 +305,19 @@ fn process_strategy(
     
     // 使用image库提取帧
     let temp_frames = match NamedTempFile::new() {
-        Ok(file) => TempFile::new(file),
+        Ok(file) => match TempFile::new(file) {
+            Ok(tf) => tf,
+            Err(e) => {
+                log(&format!("  创建临时文件(keep)失败: {}", e));
+                return StrategyResult {
+                    size: f64::MAX,
+                    file: None,
+                    success: false,
+                };
+            }
+        },
         Err(_) => {
-            log("  创建临时文件失败");
+            log("  创建 NamedTempFile 失败");
             return StrategyResult {
                 size: f64::MAX,
                 file: None,
@@ -378,9 +380,19 @@ fn process_strategy(
     
     // 优化提取后的帧
     let temp_frames_opt = match NamedTempFile::new() {
-        Ok(file) => TempFile::new(file),
+        Ok(file) => match TempFile::new(file) {
+            Ok(tf) => tf,
+            Err(e) => {
+                log(&format!("  创建优化临时文件(keep)失败: {}", e));
+                return StrategyResult {
+                    size: f64::MAX,
+                    file: None,
+                    success: false,
+                };
+            }
+        },
         Err(_) => {
-            log("  创建优化临时文件失败");
+            log("  创建优化 NamedTempFile 失败");
             return StrategyResult {
                 size: f64::MAX,
                 file: None,
@@ -483,10 +495,14 @@ fn process_strategy(
         for &level in chunk {
             match NamedTempFile::new() {
                 Ok(file) => {
-                    temp_files.push((level, TempFile::new(file)));
+                    // 修改 TempFile::new 调用，处理 Result
+                    match TempFile::new(file) {
+                        Ok(tf) => temp_files.push((level, tf)),
+                        Err(e) => log(&format!("  创建lossy={}临时文件(keep)失败: {}", level, e)),
+                    }
                 },
                 Err(_) => {
-                    log(&format!("  创建lossy={}临时文件失败", level));
+                    log(&format!("  创建lossy={} NamedTempFile 失败", level));
                 }
             }
         }
@@ -586,10 +602,20 @@ fn process_strategy(
         }
     }
     
+    // Prepare the result to be returned
+    let final_best_file_for_return = best_file.clone(); // Clone the Option<TempFile>
+
+    // If we have a best file locally, prevent its Drop implementation from running
+    // because we are transferring responsibility via the clone.
+    if let Some(local_best) = best_file {
+         std::mem::forget(local_best);
+    }
+
+    // Return the result containing the cloned Option<TempFile>
     StrategyResult {
         size: best_size,
-        file: best_file,
-        success: true,
+        file: final_best_file_for_return,
+        success: true, // Assuming we found at least one valid result
     }
 }
 
@@ -624,8 +650,11 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     
     // 基础优化 - 使用gifsicle的最高优化级别和更多高级选项
     let temp_file = NamedTempFile::new()?;
-    let temp_file_opt = TempFile::new(temp_file);
+    let temp_file_opt = TempFile::new(temp_file)?;
     let temp_file_opt_path = temp_file_opt.path_str();
+    
+    // 保存基础优化文件路径的副本，以便后续可能需要作为备选
+    let temp_file_opt_path_copy = PathBuf::from(&temp_file_opt_path);
     
     // 使用String而不是&str，避免生命周期问题
     let input_path_str = input_path.as_ref().to_string_lossy().to_string();
@@ -747,39 +776,53 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut best_size = opt_size;
     let mut best_file: Option<TempFile> = Some(temp_file_opt);
     let mut found_solution = false;
+    let mut files_to_cleanup: Vec<TempFile> = Vec::new(); // <--- 新增：待清理文件列表
     
     // 从通道接收结果
     for result in rx.iter() {
         if !result.success {
+            // 如果结果的文件存在，也要加入清理列表
+            if let Some(file) = result.file {
+                files_to_cleanup.push(file);
+            }
             continue;
         }
         
+        // 确保 result.file 是 Some
+        let result_file = match result.file {
+            Some(file) => file,
+            None => continue, // 没有文件，无法比较或使用
+        };
+
         if result.size <= target_size_kb {
-            // 清理之前的最佳文件（如果有的话）
+            // 清理之前的最佳文件（如果有的话），将其加入待清理列表
             if let Some(old_file) = best_file.take() {
-                let _ = old_file.cleanup();
+                // let _ = old_file.cleanup(); // <--- 移除：不再立即清理
+                files_to_cleanup.push(old_file); // <--- 修改：加入待清理列表
             }
             
             best_size = result.size;
-            best_file = result.file;
+            best_file = Some(result_file); // 使用 result_file
             found_solution = true;
             println!("找到达到目标大小的策略! 大小: {:.2} KB", best_size);
             // 设置标志，以便其他线程可以提前退出
             shared_state.set_found_target();
             break; // 提前退出循环，不再处理其他结果
         } else if result.size < best_size {
-            // 清理之前的最佳文件（如果有的话）
+            // 清理之前的最佳文件（如果有的话），将其加入待清理列表
             if let Some(old_file) = best_file.take() {
-                let _ = old_file.cleanup();
+                // let _ = old_file.cleanup(); // <--- 移除：不再立即清理
+                files_to_cleanup.push(old_file); // <--- 修改：加入待清理列表
             }
             
             best_size = result.size;
-            best_file = result.file;
-        } else if result.file.is_some() {
-            // 该结果不比当前最佳结果好，清理它
-            if let Some(file) = result.file {
-                let _ = file.cleanup();
-            }
+            best_file = Some(result_file); // 使用 result_file
+        } else {
+            // 该结果不比当前最佳结果好，将其文件加入待清理列表
+            // if let Some(file) = result.file { // <--- 移除
+            //     let _ = file.cleanup(); // <--- 移除
+            // } // <--- 移除
+            files_to_cleanup.push(result_file); // <--- 修改：加入待清理列表
         }
     }
     
@@ -799,14 +842,42 @@ fn optimize_gif<P: AsRef<Path>, Q: AsRef<Path>>(
     // 使用找到的最佳文件
     if let Some(best) = best_file {
         println!("\n复制最佳结果到输出文件...");
-        fs::copy(&best.path, &output_path)?;
         
-        // 复制完成后清理临时文件
-        let _ = best.cleanup();
+        // 添加文件存在性验证
+        println!("检查文件存在性: {}", &best.path.display());
+        if !best.path.exists() {
+            println!("⚠️ 警告：文件不存在，尝试使用备份");
+            
+            // 如果基础优化文件还存在（备份），尝试直接使用它
+            if temp_file_opt_path_copy.exists() {
+                println!("使用基础优化文件作为备选: {}", &temp_file_opt_path_copy.display());
+                fs::copy(&temp_file_opt_path_copy, &output_path)?;
+            } else {
+                println!("❌ 错误：基础优化文件也不存在");
+                return Err(GifError::Other("无法找到有效的临时文件进行复制".to_string()));
+            }
+        } else {
+            // 文件存在，执行正常复制
+            fs::copy(&best.path, &output_path)?;
+        }
         
         let final_size = get_file_size_kb(&output_path)?;
         println!("完成! 最终大小: {:.2} KB", final_size);
+
+        // 清理临时文件
+        println!("清理临时文件...");
+        let _ = best.cleanup(); // 手动清理最佳文件
+        for file_to_clean in files_to_cleanup {
+            let _ = file_to_clean.cleanup(); // 手动清理其他文件
+        }
+
     } else {
+        // 如果 best_file 是 None (例如基础优化后就满足条件，但逻辑上应该总有 best_file)
+        // 确保清理所有可能产生的临时文件
+        println!("清理临时文件...");
+        for file_to_clean in files_to_cleanup {
+            let _ = file_to_clean.cleanup();
+        }
         return Err(GifError::NoValidResults);
     }
     
