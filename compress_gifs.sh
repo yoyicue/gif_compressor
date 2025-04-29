@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 定义路径和选项
-EXECUTABLE="target/debug/gif_compressor"
+EXECUTABLE="target/release/gif_compressor"
 INPUT_DIR="input"
 OUTPUT_DIR="output"
 TEMP_DIR="temp_compression_tests"
